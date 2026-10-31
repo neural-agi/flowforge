@@ -5,10 +5,6 @@ if ! command -v docker >/dev/null 2>&1; then
   echo "error: docker is required" >&2
   exit 1
 fi
-if ! command -v psql >/dev/null 2>&1; then
-  echo "error: psql is required (or use the documented Docker database shell)" >&2
-  exit 1
-fi
 if ! command -v flowforge >/dev/null 2>&1; then
   echo "error: flowforge is not installed; install the project in a Python 3.12 environment" >&2
   exit 1
@@ -23,6 +19,9 @@ workflow_line=$(flowforge start --workflow order_fulfillment --idempotency-key "
 echo "$workflow_line"
 workflow_id=${workflow_line#workflow_id=}
 workflow_id=${workflow_id%% *}
+
+echo "--- complete reserve_inventory normally ---"
+flowforge worker --once
 
 set +e
 FLOWFORGE_CRASH_AFTER_EFFECT=charge_payment flowforge worker --once
@@ -42,5 +41,13 @@ flowforge worker --until-idle
 echo "--- recovered final state ---"
 flowforge status "$workflow_id"
 flowforge history "$workflow_id"
-psql "${FLOWFORGE_DATABASE_URL:-postgresql://flowforge:flowforge_dev_password@localhost:5432/flowforge}" \
-  -c "SELECT idempotency_key, count(*) FROM payment_effects WHERE workflow_id = '$workflow_id' GROUP BY idempotency_key;"
+payment_effect_result=$(docker compose exec -T postgres psql -U flowforge -d flowforge -At -F '|' -c \
+  "SELECT idempotency_key, count(*) FROM payment_effects WHERE workflow_id = '$workflow_id' GROUP BY idempotency_key;")
+expected_payment_effect="${workflow_id}:charge_payment|1"
+normalized_payment_effect=$(printf '%s' "$payment_effect_result" | tr -d '\r\n')
+echo "payment_effect_result=$normalized_payment_effect"
+if [[ "$normalized_payment_effect" != "$expected_payment_effect" ]]; then
+  echo "error: expected exactly one payment effect for $expected_payment_effect" >&2
+  exit 1
+fi
+echo "verified: exactly one payment effect"
