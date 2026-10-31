@@ -119,7 +119,7 @@ changes the polling delay.
 | Tests | Unit tests plus opt-in Postgres integration tests |
 
 > [!NOTE]
-> Live integration verification requires an explicit `FLOWFORGE_TEST_DATABASE_URL`.
+> Live PostgreSQL integration tests and the crash-recovery demo have been verified locally with Docker.
 
 ## What it doesn't do
 
@@ -186,7 +186,7 @@ flowforge/
 - [x] Idempotent mock payment
 - [x] Retries and lease recovery
 - [x] Crash-after-side-effect demo
-- [ ] Run the Postgres integration tests against a live database (needs a local Docker run)
+- [x] Live Postgres integration tests and crash-recovery demo verified locally
 - [ ] Multiple workers
 - [ ] Parallel branches and joins
 - [ ] HTTP API and a status UI
