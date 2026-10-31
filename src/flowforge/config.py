@@ -12,4 +12,8 @@ class Settings:
 
     @classmethod
     def from_environment(cls) -> "Settings":
-        return cls(database_url=os.getenv("FLOWFORGE_DATABASE_URL", DEFAULT_DATABASE_URL))
+        return cls(
+            database_url=os.getenv(
+                "FLOWFORGE_DATABASE_URL", os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
+            )
+        )
