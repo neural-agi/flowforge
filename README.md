@@ -69,6 +69,14 @@ make up
 make migrate
 ```
 
+The application reads `FLOWFORGE_DATABASE_URL` first and accepts `DATABASE_URL` as a
+compatibility fallback. If your shell does not load `.env`, export the canonical
+variable before using the CLI:
+
+```bash
+export FLOWFORGE_DATABASE_URL=postgresql://flowforge:flowforge_dev_password@localhost:5432/flowforge
+```
+
 Then run the crash demo:
 
 ```bash
@@ -76,6 +84,12 @@ scripts/demo_crash_recovery.sh
 ```
 
 The script starts a workflow, kills the worker for real right after the payment is accepted, starts a new worker after the lease expires, and checks that exactly one payment effect exists. The diagram above is the exact sequence it walks through.
+
+For deterministic manual execution, use `flowforge worker --once` for one step,
+`flowforge worker --until-idle` for every currently due step, or
+`flowforge worker --poll` for a long-running worker that checks again every second
+when idle. `--max-steps N` applies to `--until-idle`; `--poll-interval SECONDS`
+changes the polling delay.
 
 <details>
 <summary>Same thing, step by step</summary>
@@ -96,16 +110,16 @@ The script starts a workflow, kills the worker for real right after the payment 
 | --- | --- |
 | Workflow | One hardcoded workflow, `order_fulfillment`, that runs its steps in order |
 | State | Workflow, step, attempt, lease, output, error, and history records, all stored in Postgres |
-| Worker | A CLI worker that atomically claims the next runnable step and runs it |
+| Worker | Single-step, until-idle, and one-second polling modes with atomic claims |
 | Retries | Bounded exponential backoff |
 | Recovery | Expired worker leases get recovered, so abandoned steps can be tried again safely |
 | Payments | A mock provider that stores one payment per idempotency key |
 | Failure injection | Crash the worker on purpose after the payment is accepted but before the step is completed |
 | CLI | Check a workflow's status and read its history in order |
-| Tests | Unit tests, plus integration tests for the recovery logic that run against Postgres |
+| Tests | Unit tests plus opt-in Postgres integration tests |
 
 > [!NOTE]
-> I wrote the integration tests but haven't run them against a live database yet (see the to-do list at the bottom).
+> Live integration verification requires an explicit `FLOWFORGE_TEST_DATABASE_URL`.
 
 ## What it doesn't do
 

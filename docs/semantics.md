@@ -24,7 +24,7 @@ The case I built it around: a worker completes an external side effect, then cra
 | --- | --- | --- |
 | Durable state in Postgres | **Yes** | Workflow and step state, attempts, timestamps, inputs, outputs, errors, and history |
 | At-least-once step execution | **Yes** | A step can run again after an interruption or an expired lease |
-| Persisted retries with backoff | **Yes** | Up to three total attempts, with delays of 1, 2, and 4 seconds |
+| Persisted retries with backoff | **Yes** | Up to three total attempts; delays after attempts one and two are 1 and 2 seconds |
 | Recovery after worker failure | **Yes** | Done through expiring worker leases |
 | Deterministic side-effect keys | **Yes** | Format is `{workflow_id}:{step_name}`. An external system that honors the key can return the original result on a repeat request instead of creating another effect |
 | Exactly-once execution or delivery | **No** | Not in general |
@@ -83,7 +83,7 @@ Completed steps can't be claimed again, so a normal restart never re-runs them.
 
 ## Retries
 
-Only errors explicitly marked retryable (transient ones) move a step into `retry_wait`. The retry schedule is saved as the next eligible timestamp. The limit is three total attempts, with exponential delays of 1, 2, and 4 seconds as the configured retry policy calls for them.
+Only errors explicitly marked retryable (transient ones) move a step into `retry_wait`. The retry schedule is saved as the next eligible timestamp. The limit is three total attempts: a failure after attempt one waits 1 second before attempt two, and a failure after attempt two waits 2 seconds before attempt three. There is no 4-second wait because no fourth attempt is allowed.
 
 - **Retryable error before the third attempt:** the worker records the error, the attempt result, a retry event, and the next eligible time. Once that time passes, any worker can claim the step.
 - **Final allowed attempt fails:** the step becomes `failed` and the workflow fails for good.

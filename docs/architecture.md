@@ -63,7 +63,7 @@ flowchart TD
     E -->|success| F["Save output, schedule next step<br/>(or complete the workflow)"]
     E -->|retryable error| G["Save retry state and<br/>next eligible time"]
     E -->|terminal error| H["Mark step and workflow failed"]
-    F --> I["Wait 1 second"]
+    F --> I["Wait when idle"]
     G --> I
     H --> I
     I --> A
@@ -78,7 +78,7 @@ flowchart TD
 4. Resolve the step through the workflow registry and run its activity.
 5. Persist success, retry, or terminal failure depending on the classified result.
 6. On success, persist the output and schedule the next sequential step in one transaction. After the final step, mark the workflow completed.
-7. Poll again after one second.
+7. In polling mode, poll again after one second only when no runnable work was processed; deterministic modes return when no work is due.
 
 </details>
 
