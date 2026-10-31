@@ -1,83 +1,112 @@
-# FlowForge Architecture
+# FlowForge architecture
 
-FlowForge is a Python 3.12, PostgreSQL-backed, CLI-first execution engine for one code-defined sequential workflow. The MVP uses `argparse`, direct SQL through `psycopg`, and numbered SQL migrations planned for a later implementation phase.
+[← back to the README](../README.md)
 
-## High-level design
+FlowForge is a CLI-first execution engine written in Python 3.12 and backed by PostgreSQL. It runs one workflow that's defined in code. The stack is plain: `argparse` for the CLI, direct SQL through `psycopg`, and numbered SQL migrations for the schema.
 
-```text
-                 ┌──────────────┐
-                 │     CLI      │
-                 │ argparse     │
-                 └──────┬───────┘
-                        │ start/status/history
-                        v
-┌──────────────┐  SQL  ┌────────────────┐  SQL  ┌────────────────────┐
-│    Worker    │◄─────►│   PostgreSQL   │◄─────►│ Mock payment        │
-│ poll/execute │       │ durable state │       │ provider/effects     │
-└──────┬───────┘       └────────────────┘       └────────────────────┘
-       │
-       v
-┌──────────────┐       ┌──────────────────┐
-│ Workflow     │──────►│ Activity handlers │
-│ registry     │       │ inventory/payment │
-│ sequential   │       │ /receipt          │
-└──────────────┘       └──────────────────┘
+[Big picture](#the-big-picture) · [Components](#components) · [Database](#database-entities) · [Worker loop](#the-worker-loop) · [Transactions](#transaction-boundaries) · [Multiple workers](#multiple-workers) · [Deferred](#deferred-work)
+
+---
+
+## The big picture
+
+```mermaid
+flowchart LR
+    CLI["CLI<br/>argparse"]
+    W["Worker<br/>poll and execute"]
+    DB[("PostgreSQL<br/>durable state")]
+    PP["Mock payment provider<br/>payment_effects"]
+    REG["Workflow registry<br/>sequential"]
+    ACT["Activity handlers<br/>inventory / payment / receipt"]
+
+    CLI -->|start, status, history| DB
+    CLI -->|run worker| W
+    W <-->|SQL| DB
+    DB <-->|SQL| PP
+    W --> REG
+    REG --> ACT
 ```
 
-The diagram shows logical boundaries, not network requirements. The mock payment provider is PostgreSQL-backed so its uniqueness guarantee participates in the same durable local system, while still modeling a downstream side-effecting service.
+Those boxes are logical boundaries. They don't have to be separate services on a network. The mock payment provider is backed by Postgres so its uniqueness guarantee lives in the same local system, but it still stands in for a downstream service with real side effects.
 
-## Components and boundaries
+## Components
 
-- **CLI:** Accepts workflow start, worker, status, and history operations. It validates user input and delegates persistence or execution; it does not hold correctness-critical state.
-- **PostgreSQL:** The source of truth for workflows, steps, attempts, events, leases, retry timing, and payment effects.
-- **Worker:** Polls every second, recovers expired leases, claims eligible work, invokes activities, and records outcomes. A worker process may crash at any point.
-- **Workflow registry:** Maps the fixed workflow name and step names to their ordered definition and activity handler. It is code-defined, not user-authored.
-- **Activity handlers:** Perform the small domain operations for inventory, payment, and receipt. They return explicit success or classified retryable/terminal errors.
-- **Mock payment provider:** Accepts a payment idempotency key, stores the first payment result, and returns that result for duplicates. A unique database constraint on the key prevents two payments for one key.
+| Component | What it does |
+| --- | --- |
+| **CLI** | Takes the start, worker, status, and history commands. It validates input and hands off to persistence or execution. It holds no state that correctness depends on. |
+| **PostgreSQL** | The source of truth for workflows, steps, attempts, events, leases, retry timing, and payment effects. |
+| **Worker** | Polls every second, recovers expired leases, claims eligible work, runs activities, and records the outcome. A worker can crash at any point. |
+| **Workflow registry** | Maps the fixed workflow name and its step names to the ordered definition and the activity handler for each step. It's defined in code, so nobody authors workflows at runtime. |
+| **Activity handlers** | Do the small domain operations for inventory, payment, and receipt. They return either success or a classified error, retryable or terminal. |
+| **Mock payment provider** | Accepts a payment idempotency key, stores the first result, and returns that same result for duplicates. A unique constraint on the key is what stops two payments for one key. |
 
-## Planned database entities
+## Database entities
 
-The exact SQL schema will be designed in the migration phase. The intended entities and essential fields are:
+The schema lives in `migrations/`. These are the entities and the fields that matter most:
 
 | Entity | Essential fields |
-|---|---|
+| --- | --- |
 | `workflows` | workflow ID, workflow type, input, status, created/updated timestamps, completion/error data |
 | `workflow_steps` | workflow ID, step name/order, state, input/output, attempt count, next eligible time, lease owner/expiry, error data, timestamps |
 | `step_attempts` | attempt ID, workflow/step references, attempt number, worker identity, claimed/started/finished timestamps, outcome, error |
 | `workflow_events` | event ID, workflow/step references, event type, attempt/worker metadata, payload, timestamp |
 | `payment_effects` | idempotency key with a unique constraint, payment ID/result, request data, created timestamp |
 
-## Planned worker loop
+## The worker loop
+
+```mermaid
+flowchart TD
+    A["Recover steps whose 30s lease expired,<br/>append recovery history"] --> B["Atomically claim one runnable step"]
+    B --> C["Record the attempt and claim event"]
+    C --> D["Look up the step in the registry,<br/>run its activity"]
+    D --> E{"Result"}
+    E -->|success| F["Save output, schedule next step<br/>(or complete the workflow)"]
+    E -->|retryable error| G["Save retry state and<br/>next eligible time"]
+    E -->|terminal error| H["Mark step and workflow failed"]
+    F --> I["Wait 1 second"]
+    G --> I
+    H --> I
+    I --> A
+```
+
+<details>
+<summary>The same loop as a list</summary>
 
 1. Recover running steps whose 30-second lease has expired and append recovery history.
-2. Atomically claim one runnable step using row locks and `FOR UPDATE SKIP LOCKED` or an equivalent safe pattern.
-3. Record the attempt and claim event as part of the claim transaction.
-4. Resolve the step through the workflow registry and invoke its activity.
-5. Persist success, retry, or terminal failure according to the classified result.
+2. Atomically claim one runnable step using row locks and `FOR UPDATE SKIP LOCKED` (or an equivalent safe pattern).
+3. Record the attempt and the claim event as part of the claim transaction.
+4. Resolve the step through the workflow registry and run its activity.
+5. Persist success, retry, or terminal failure depending on the classified result.
 6. On success, persist the output and schedule the next sequential step in one transaction. After the final step, mark the workflow completed.
-7. Poll again after the one-second interval.
+7. Poll again after one second.
 
-The worker may be stopped or killed between any two operations. Correctness comes from PostgreSQL state, not from an in-memory queue or local progress marker.
+</details>
 
-## Transaction boundaries and concurrency
+The worker can be stopped or killed between any two operations. Correctness comes from the state in Postgres, never from an in-memory queue or a local progress marker.
 
-Claiming is one transaction: it locks an eligible step, assigns the worker and lease, increments/records the attempt, and writes the claim history. Competing workers skip locked rows and cannot claim the same currently leased step.
+## Transaction boundaries
 
-Completion is one transaction: it verifies the lease, stores the activity output, marks the step succeeded, writes the success event, and either makes the successor runnable or completes the workflow. Retry and failure transactions similarly persist the outcome, error, event, and next state together.
+Three kinds of transaction do the real work, and each one commits everything it touches together:
 
-The external activity call is intentionally outside the completion transaction. PostgreSQL cannot atomically commit with an arbitrary external system, so an activity can succeed while FlowForge is still unrecorded. Stable idempotency keys are the protection for repeatable side effects.
+| Transaction | What commits together |
+| --- | --- |
+| **Claim** | Locks an eligible step, assigns the worker and lease, records the attempt, writes the claim history. Competing workers skip locked rows, so two of them can't claim the same leased step. |
+| **Completion** | Verifies the lease, stores the activity output, marks the step succeeded, writes the success event, and either makes the next step runnable or completes the workflow. |
+| **Retry / failure** | Persists the outcome, the error, the event, and the next state. |
 
-## Compatibility with multiple workers
+> [!WARNING]
+> The external activity call sits outside the completion transaction on purpose. Postgres can't atomically commit together with an arbitrary external system, so an activity can succeed while FlowForge still has nothing recorded. Stable idempotency keys are what protect side effects that might get repeated.
 
-Although the MVP demo can run one worker, each claim is lease-based and database-coordinated. Worker identity, lease expiration, row locking, and `SKIP LOCKED` avoid a shared in-memory scheduler and allow multiple workers to poll the same database later. The design still requires activities to honor their idempotency contract wherever side effects can be repeated.
+## Multiple workers
+
+The demo can run a single worker, but every claim is lease-based and coordinated through the database: worker identity, lease expiration, row locking, and `SKIP LOCKED`. There's no shared in-memory scheduler, so more workers can poll the same database later. Activities still have to honor their idempotency contract anywhere a side effect can repeat.
 
 ## Deferred work
 
-The following are intentionally out of scope for the MVP:
+Left out of the MVP on purpose:
 
 - Parallel branches and joins
 - Worker pools
 - HTTP APIs
 - Dashboards
 - Benchmarks
-
