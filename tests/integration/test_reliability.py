@@ -1,6 +1,8 @@
 """PostgreSQL reliability checks; skipped unless explicitly configured."""
 
 import os
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -10,6 +12,8 @@ import pytest
 from flowforge.config import Settings
 from flowforge.models import StepSpecification
 from flowforge.repository import WorkflowRepository
+from flowforge.worker import Worker
+from flowforge.workflows.order_fulfillment import get_workflow_definition
 
 DATABASE_URL = os.getenv("FLOWFORGE_TEST_DATABASE_URL")
 pytestmark = pytest.mark.integration
@@ -115,3 +119,59 @@ def test_exhausted_expired_lease_fails_workflow(repository):
         connection.commit()
     assert repository.recover_expired_leases() == 1
     assert repository.get_workflow(workflow.id)[0].status.value == "failed"
+
+
+def test_crash_after_payment_recovers_to_success(repository):
+    key = str(uuid4())
+    payload = {
+        "order_id": f"order-{key}",
+        "sku": "demo-widget",
+        "quantity": 1,
+        "amount_cents": 1999,
+        "currency": "USD",
+        "customer_email": "customer@example.com",
+    }
+    definition = get_workflow_definition("order_fulfillment")
+    workflow = repository.create_workflow(
+        definition.name,
+        definition.version,
+        f"integration-{key}",
+        payload,
+        definition.specifications(payload),
+    )
+    Worker(repository, "integration-first-worker").run_once()
+    environment = os.environ.copy()
+    environment["FLOWFORGE_TEST_DATABASE_URL"] = DATABASE_URL
+    environment["FLOWFORGE_CRASH_AFTER_EFFECT"] = "charge_payment"
+    environment["PYTHONPATH"] = "src"
+    result = subprocess.run(
+        [sys.executable, "-m", "flowforge.cli", "worker", "--once"],
+        cwd=os.getcwd(),
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 137, result.stderr
+    with psycopg.connect(DATABASE_URL) as connection:
+        connection.execute(
+            """UPDATE workflow_steps SET lease_expires_at = NOW() - INTERVAL '1 second'
+               WHERE workflow_id = %s AND step_name = 'charge_payment'""",
+            (workflow.id,),
+        )
+        connection.commit()
+    Worker(repository, "integration-recovery-worker").run_until_idle()
+    state = repository.get_workflow(workflow.id)
+    assert state[0].status.value == "succeeded"
+    assert [step.status.value for step in state[1]] == ["succeeded"] * 3
+    with psycopg.connect(DATABASE_URL) as connection:
+        count = connection.execute(
+            "SELECT count(*) FROM payment_effects WHERE workflow_id = %s AND idempotency_key = %s",
+            (workflow.id, f"{workflow.id}:charge_payment"),
+        ).fetchone()[0]
+    assert count == 1
+    event_types = [event.event_type for event in repository.get_history(workflow.id)]
+    assert "step_claimed" in event_types
+    assert "step_lease_expired" in event_types
+    assert "step_retry_scheduled" in event_types
+    assert "step_succeeded" in event_types
+    assert "workflow_succeeded" in event_types
