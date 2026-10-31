@@ -2,6 +2,7 @@
 
 import logging
 import os
+import time
 from datetime import timedelta
 from uuid import UUID, uuid4
 
@@ -84,6 +85,13 @@ class Worker:
                 break
             processed += 1
         return processed
+
+    def run_polling(self, poll_interval: float = 1.0) -> None:
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be positive")
+        while True:
+            if not self.run_once():
+                time.sleep(poll_interval)
 
     def _invoke(
         self, step_name: str, workflow_id: UUID, payload: dict[str, object]

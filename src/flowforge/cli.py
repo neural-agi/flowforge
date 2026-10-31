@@ -28,8 +28,10 @@ def build_parser() -> argparse.ArgumentParser:
     mode = worker.add_mutually_exclusive_group(required=True)
     mode.add_argument("--once", action="store_true")
     mode.add_argument("--until-idle", action="store_true")
+    mode.add_argument("--poll", action="store_true")
     worker.add_argument("--worker-id")
     worker.add_argument("--max-steps", type=int)
+    worker.add_argument("--poll-interval", type=float, default=1.0)
 
     for name in ("status", "history"):
         command = commands.add_parser(name)
@@ -57,15 +59,15 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "worker":
             if args.max_steps is not None and not args.until_idle:
                 raise ValueError("--max-steps requires --until-idle")
+            if args.poll_interval <= 0:
+                raise ValueError("--poll-interval must be positive")
             worker = Worker(repository, args.worker_id)
-            processed = (
-                1
-                if worker.run_once()
-                else 0
-                if args.once
-                else worker.run_until_idle(args.max_steps)
-            )
-            print(f"processed_steps={processed}")
+            if args.once:
+                print(f"processed_steps={1 if worker.run_once() else 0}")
+            elif args.until_idle:
+                print(f"processed_steps={worker.run_until_idle(args.max_steps)}")
+            else:
+                worker.run_polling(args.poll_interval)
         elif args.command == "status":
             summary = repository.get_status_summary(UUID(args.workflow_id))
             if summary is None:
